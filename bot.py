@@ -13,8 +13,8 @@ from telegram.ext import (
 )
 
 # ─── 环境变量（在Render上设置，不要硬编码） ────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["8322901183:AAFQVJQXgGEMII6VnBFEewF_vtrOQSJ_gGg"]   # 从 @BotFather 拿
-LLM_API_KEY    = os.environ["sk-b4ac8baabb0b4c8ea65c4702d6d8a3f1"]      # 大模型 key
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]   # 从 @BotFather 拿
+LLM_API_KEY    = os.environ["LLM_API_KEY"]      # 大模型 key
 LLM_BASE_URL   = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")  # 默认DeepSeek，改成你的
 MODEL_NAME     = os.environ.get("MODEL_NAME", "deepseek-chat")                  # 默认模型
 
