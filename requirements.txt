@@ -1,0 +1,3 @@
+python-telegram-bot[all]==21.4  # 或最新版
+openai==1.30.0                 # 或最新
+uvicorn==0.30.1                # Web服务器
