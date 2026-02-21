@@ -27,9 +27,9 @@ BOT_PERSONALITY = os.environ.get("BOT_PERSONALITY", "你是一个聪明又有趣
 # 🎛️ 可控参数
 MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "4000"))
 LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "500"))  # 从2000改为500
-MAX_HISTORY_ROUNDS = int(os.environ.get("MAX_HISTORY_ROUNDS", "10"))  # 新增：最大历史轮数
-CONTEXT_TIMEOUT    = int(os.environ.get("CONTEXT_TIMEOUT", "10"))  # 新增：上下文超时时间（分钟）
+LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "500"))
+MAX_HISTORY_ROUNDS = int(os.environ.get("MAX_HISTORY_ROUNDS", "10"))
+CONTEXT_TIMEOUT    = int(os.environ.get("CONTEXT_TIMEOUT", "10"))
 
 PORT               = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH       = "/webhook"
@@ -43,8 +43,7 @@ client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=60.0)
 tg_app = None
 
 # ──────────────────────── Token 估算函数 ────────────────────────
-# 使用 tiktoken 进行更准确的 token 计算
-encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")  # 可根据实际模型调整
+encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 def estimate_tokens(messages):
     """使用 tiktoken 准确计算 token 数量"""
@@ -52,7 +51,6 @@ def estimate_tokens(messages):
         text = "".join([msg["content"] for msg in messages])
         return len(encoding.encode(text))
     except Exception:
-        # 备用方案：字符数估算
         text = "".join([msg["content"] for msg in messages])
         return len(text) // 1.5
 
@@ -63,25 +61,57 @@ def cleanup_expired_context():
     expired_users = []
     
     for user_id, user_data in user_history.items():
-        # 检查时间超时
         if current_time - user_data["last_access"] > CONTEXT_TIMEOUT * 60:
             expired_users.append(user_id)
     
-    # 清理过期用户
     for user_id in expired_users:
         del user_history[user_id]
         print(f"[清理] 用户 {user_id} 的上下文已过期并被清理")
 
 # ──────────────────────── Handlers ────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！我是由大模型驱动的机器人，随便聊～")
+    await update.message.reply_text("你好！我是由大模型驱动的机器人，随便聊～\n\n可用命令:\n/start - 开始使用\n/reset - 重置当前对话\n/clearHistory - 清理所有历史记录\n/stats - 查看统计信息")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """重置当前用户的对话历史"""
     user_id = update.effective_user.id
     if user_id in user_history:
         user_history[user_id]["history"].clear()
         user_history[user_id]["last_access"] = time.time()
-    await update.message.reply_text("✅ 已重置对话历史")
+    await update.message.reply_text("✅ 已重置当前对话历史")
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """清理当前用户的所有历史记录"""
+    user_id = update.effective_user.id
+    if user_id in user_history:
+        user_history[user_id]["history"].clear()
+        user_history[user_id]["last_access"] = time.time()
+        await update.message.reply_text("🗑️ 已清理您的所有对话历史记录")
+    else:
+        await update.message.reply_text("😅 您还没有任何对话历史记录")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """显示统计信息"""
+    user_id = update.effective_user.id
+    total_users = len(user_history)
+    
+    if user_id in user_history:
+        user_histories = user_history[user_id]["history"]
+        user_messages = len(user_histories)
+        user_tokens = estimate_tokens([{"role": "user", "content": msg["content"]} for msg in user_histories if msg["role"] == "user"])
+        last_active = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_history[user_id]["last_access"]))
+        
+        stats_text = f"""📊 统计信息:
+-users): {total_users}
+- 当前用户消息数: {user_messages}
+- 当前用户估算 tokens: {user_tokens}
+- 最后活跃时间: {last_active}"""
+    else:
+        stats_text = f"""📊 统计信息:
+- 活跃用户数: {total_users}
+- 您还没有任何对话历史"""
+
+    await update.message.reply_text(stats_text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -106,22 +136,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_context = [system_msg] + history
         tokens = estimate_tokens(full_context)
         
-        # 检查 token 数量
         if tokens <= MAX_CONTEXT_TOKENS:
             messages = full_context
             break
-        # 检查历史轮数
-        elif len(history) > MAX_HISTORY_ROUNDS * 2:  # user + assistant 为一轮
-            history = history[2:]  # 移除最前面的一轮对话
-        # 剪裁历史记录
+        elif len(history) > MAX_HISTORY_ROUNDS * 2:
+            history = history[2:]
         elif len(history) > 1:
             if len(history) >= 2 and history[0]["role"] == "user" and history[1]["role"] == "assistant":
                 history = history[2:]
             else:
                 history = history[1:]
         else:
-            # 最后手段：裁剪单条消息内容
-            history[-1]["content"] = history[-1]["content"][-500:]  # 减少到500字符
+            history[-1]["content"] = history[-1]["content"][-500:]
             break
 
     # 🔄 根据 STREAM_SWITCH 决定调用方式
@@ -149,7 +175,7 @@ async def handle_stream_response(update, messages, history):
             messages=messages,
             temperature=LLM_TEMPERATURE,
             max_tokens=LLM_MAX_TOKENS,
-            stream=True  # ✅ 开启流式传输
+            stream=True
         )
         
         async for chunk in response:
@@ -157,18 +183,15 @@ async def handle_stream_response(update, messages, history):
                 content = chunk.choices[0].delta.content
                 assistant_reply += content
                 
-                # 发送流式内容（Telegram 消息不能太频繁）
                 if not message_obj:
                     message_obj = await update.message.reply_text(content or "...")
                 else:
-                    # 编辑现有消息（注意频率限制）
                     try:
-                        if len(assistant_reply) % 20 == 0 or len(assistant_reply) < 200:  # 控制更新频率
+                        if len(assistant_reply) % 20 == 0 or len(assistant_reply) < 200:
                             await message_obj.edit_text(assistant_reply[:4000] or "...", disable_web_page_preview=True)
                     except Exception:
-                        pass  # 忽略编辑错误
+                        pass
         
-        # 最终整理并保存历史
         if assistant_reply:
             history.append({"role": "assistant", "content": assistant_reply})
             try:
@@ -199,7 +222,6 @@ async def ask_llm(messages, stream=False):
         )
         
         if stream:
-            # 流式响应在外面处理
             return resp
         else:
             return resp.choices[0].message.content.strip()
@@ -212,6 +234,9 @@ async def init():
     tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("reset", reset))
+    tg_app.add_handler(CommandHandler("clearhistory", clear_history))  # 新增命令
+    tg_app.add_handler(CommandHandler("clearHistory", clear_history))  # 兼容大小写
+    tg_app.add_handler(CommandHandler("stats", stats))  # 新增统计命令
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await tg_app.initialize()
