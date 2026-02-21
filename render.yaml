@@ -6,4 +6,4 @@ services:
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10
+        value: 3.11   # 👈 强制使用 Python 3.11
