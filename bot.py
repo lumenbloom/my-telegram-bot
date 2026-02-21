@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from contextlib import asynccontextmanager
-import httpx
+import asyncio
 
 # ──────────────────────── 环境变量配置 ────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -22,10 +22,11 @@ LLM_BASE_URL   = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 MODEL_NAME     = os.environ.get("MODEL_NAME", "deepseek-chat")
 BOT_PERSONALITY = os.environ.get("BOT_PERSONALITY", "你是一个聪明又有趣的助手，请说中文。")
 
-# 🎛️ 新增：基于 token 的上下文控制
-MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))  # 默认8000 tokens
+# 🎛️ 可控参数
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
 LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
+STREAM_SWITCH      = os.environ.get("STREAM_SWITCH", "false").lower() == "true"  # ✅ 流式开关
 
 PORT               = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH       = "/webhook"
@@ -39,10 +40,7 @@ tg_app = None
 
 # ──────────────────────── 简单的 token 估算函数 ────────────────────────
 def estimate_tokens(messages):
-    """估算消息列表的 token 数（简单按字符估算）"""
     text = "".join([msg["content"] for msg in messages])
-    # 粗略估算：1个 token ≈ 4个中文字符 或 1个英文单词
-    # 这里按 1 token = 1.5 字符 来估算，你可以根据模型调整
     return len(text) // 1.5
 
 # ──────────────────────── Handlers ────────────────────────
@@ -62,7 +60,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = user_history[user_id]
     history.append({"role": "user", "content": text})
     
-    # 🔁 控制历史上下文 token 长度
+    # 🔁 控制上下文长度
     while True:
         system_msg = {"role": "system", "content": BOT_PERSONALITY}
         full_context = [system_msg] + history
@@ -72,34 +70,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages = full_context
             break
         elif len(history) > 1:
-            # 移除最早的一条用户+助手对话
             if len(history) >= 2 and history[0]["role"] == "user" and history[1]["role"] == "assistant":
                 history = history[2:]
             else:
                 history = history[1:]
         else:
-            # 如果只剩下一条消息还超长，截断它
-            history[-1]["content"] = history[-1]["content"][-1000:]  # 保留最后1000字符
+            history[-1]["content"] = history[-1]["content"][-1000:]
             break
 
-    reply = await ask_llm(messages)
-    history.append({"role": "assistant", "content": reply})
+    # 🔄 根据 STREAM_SWITCH 决定调用方式
+    if STREAM_SWITCH:
+        await handle_stream_response(update, messages, history)
+    else:
+        await handle_normal_response(update, messages, history)
 
-    # 📝 分段发送长消息
-    for i in range(0, len(reply), 4000):
-        await update.message.reply_text(reply[i:i+4000])
+async def handle_normal_response(update, messages, history):
+    """普通模式：等待完整回复后一次性发送"""
+    reply = await ask_llm(messages, stream=False)
+    if reply:
+        history.append({"role": "assistant", "content": reply})
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000], disable_web_page_preview=True)
+
+async def handle_stream_response(update, messages, history):
+    """流式模式：边接收边发送"""
+    assistant_reply = ""
+    message_obj = None
+    
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS,
+            stream=True  # ✅ 开启流式传输
+        )
+        
+        async for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content = chunk.choices[0].delta.content
+                assistant_reply += content
+                
+                # 发送流式内容（Telegram 消息不能太频繁）
+                if not message_obj:
+                    message_obj = await update.message.reply_text(content or "...")
+                else:
+                    # 编辑现有消息（注意频率限制）
+                    try:
+                        if len(assistant_reply) % 20 == 0 or len(assistant_reply) < 200:  # 控制更新频率
+                            await message_obj.edit_text(assistant_reply[:4000] or "...", disable_web_page_preview=True)
+                    except Exception:
+                        pass  # 忽略编辑错误
+        
+        # 最终整理并保存历史
+        if assistant_reply:
+            history.append({"role": "assistant", "content": assistant_reply})
+            try:
+                await message_obj.edit_text(assistant_reply[:4000] or "...", disable_web_page_preview=True)
+            except:
+                pass
+                
+    except Exception as e:
+        error_msg = f"❌ 流式传输出错: {str(e)[:200]}"
+        if not message_obj:
+            await update.message.reply_text(error_msg)
+        else:
+            try:
+                await message_obj.edit_text(error_msg)
+            except:
+                await update.message.reply_text(error_msg)
 
 # ──────────────────────── 调用 LLM ────────────────────────
-async def ask_llm(messages):
+async def ask_llm(messages, stream=False):
+    """统一的 LLM 调用接口"""
     try:
         resp = await client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
             temperature=LLM_TEMPERATURE,
             max_tokens=LLM_MAX_TOKENS,
-            stream=False
+            stream=stream
         )
-        return resp.choices[0].message.content.strip()
+        
+        if stream:
+            # 流式响应在外面处理
+            return resp
+        else:
+            return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"抱歉，大模型出错了：{str(e)[:200]}"
 
@@ -114,7 +171,11 @@ async def init():
     await tg_app.initialize()
     await tg_app.bot.set_webhook(WEBHOOK_URL)
     print(f"✅ Webhook set to: {WEBHOOK_URL}")
-    print(f"🔧 配置: 最大上下文={MAX_CONTEXT_TOKENS} tokens, 温度={LLM_TEMPERATURE}, 最大输出={LLM_MAX_TOKENS}")
+    print(f"🔧 配置:")
+    print(f"   - 最大上下文: {MAX_CONTEXT_TOKENS} tokens")
+    print(f"   - 温度: {LLM_TEMPERATURE}")
+    print(f"   - 最大输出: {LLM_MAX_TOKENS}")
+    print(f"   - 流式传输: {'✅' if STREAM_SWITCH else '❌'}")
 
 # ──────────────────────── FastAPI APP Setup ────────────────────────
 @asynccontextmanager
