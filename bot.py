@@ -30,6 +30,7 @@ LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "500"))
 MAX_HISTORY_ROUNDS = int(os.environ.get("MAX_HISTORY_ROUNDS", "10"))
 CONTEXT_TIMEOUT    = int(os.environ.get("CONTEXT_TIMEOUT", "10"))
+STREAM_SWITCH      = os.environ.get("STREAM_SWITCH", "false").lower() in ("true", "1", "yes")  # 修复：添加流式传输开关
 
 PORT               = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH       = "/webhook"
@@ -102,7 +103,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_active = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_history[user_id]["last_access"]))
         
         stats_text = f"""📊 统计信息:
--users): {total_users}
+- 活跃用户数 (users): {total_users}
 - 当前用户消息数: {user_messages}
 - 当前用户估算 tokens: {user_tokens}
 - 最后活跃时间: {last_active}"""

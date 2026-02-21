@@ -2,8 +2,9 @@ services:
   - type: web
     name: telegram-bot
     env: python
+    Plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11   # 👈 强制使用 Python 3.11
+        value: 3.11
