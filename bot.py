@@ -30,7 +30,7 @@ LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "500"))
 MAX_HISTORY_ROUNDS = int(os.environ.get("MAX_HISTORY_ROUNDS", "10"))
 CONTEXT_TIMEOUT    = int(os.environ.get("CONTEXT_TIMEOUT", "10"))
-STREAM_SWITCH      = os.environ.get("STREAM_SWITCH", "false").lower() in ("true", "1", "yes")  # 修复：添加流式传输开关
+STREAM_SWITCH      = os.environ.get("STREAM_SWITCH", "false").lower() in ("true", "1", "yes")
 
 PORT               = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH       = "/webhook"
@@ -38,7 +38,6 @@ RENDER_EXTERNAL_HOSTNAME = os.environ["RENDER_EXTERNAL_HOSTNAME"]
 WEBHOOK_URL        = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 # ──────────────────────── 初始化 ────────────────────────
-# 修改 user_history 结构，包含消息历史和最后访问时间
 user_history = defaultdict(lambda: {"history": [], "last_access": time.time()})
 client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=60.0)
 tg_app = None
@@ -166,10 +165,10 @@ async def handle_normal_response(update, messages, history):
             await update.message.reply_text(reply[i:i+4000], disable_web_page_preview=True)
 
 async def handle_stream_response(update, messages, history):
-    """流式模式：边接收边发送"""
+    """流式模式：边接收边发送 - 优化版本"""
     assistant_reply = ""
     message_obj = None
-    
+
     try:
         response = await client.chat.completions.create(
             model=MODEL_NAME,
@@ -178,30 +177,43 @@ async def handle_stream_response(update, messages, history):
             max_tokens=LLM_MAX_TOKENS,
             stream=True
         )
-        
+
+        last_edit_time = time.time()
+        last_edit_length = 0
+        UPDATE_INTERVAL = 0.3  # 更新时间间隔（秒）
+        MIN_UPDATE_CHARS = 5   # 每次最少更新字符数
+
         async for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
                 assistant_reply += content
-                
+
+                # 首次回复消息
                 if not message_obj:
                     message_obj = await update.message.reply_text(content or "...")
+                    last_edit_length = len(assistant_reply)
                 else:
-                    try:
-                        if len(assistant_reply) % 20 == 0 or len(assistant_reply) < 200:
-                            await message_obj.edit_text(assistant_reply[:4000] or "...", disable_web_page_preview=True)
-                    except Exception:
-                        pass
-        
+                    current_time = time.time()
+                    # 控制刷新频率：字符数达到阈值 或 时间间隔达到阈值
+                    if (len(assistant_reply) - last_edit_length >= MIN_UPDATE_CHARS) or \
+                       (current_time - last_edit_time > UPDATE_INTERVAL):
+                        try:
+                            await message_obj.edit_text(assistant_reply[:4000] or "...")
+                            last_edit_length = len(assistant_reply)
+                            last_edit_time = current_time
+                        except Exception:
+                            pass
+
+        # 最后一次编辑，确保完整显示
         if assistant_reply:
             history.append({"role": "assistant", "content": assistant_reply})
             try:
-                await message_obj.edit_text(assistant_reply[:4000] or "...", disable_web_page_preview=True)
+                await message_obj.edit_text(assistant_reply[:4000] or "...")
             except:
                 pass
-                
+
     except Exception as e:
-        error_msg = f"❌ 流式传输出错: {str(e)[:200]}"
+        error_msg = f"❌ 流式传输失败: {str(e)[:200]}"
         if not message_obj:
             await update.message.reply_text(error_msg)
         else:
@@ -235,9 +247,9 @@ async def init():
     tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("reset", reset))
-    tg_app.add_handler(CommandHandler("clearhistory", clear_history))  # 新增命令
-    tg_app.add_handler(CommandHandler("clearHistory", clear_history))  # 兼容大小写
-    tg_app.add_handler(CommandHandler("stats", stats))  # 新增统计命令
+    tg_app.add_handler(CommandHandler("clearhistory", clear_history))
+    tg_app.add_handler(CommandHandler("clearHistory", clear_history))
+    tg_app.add_handler(CommandHandler("stats", stats))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     await tg_app.initialize()
