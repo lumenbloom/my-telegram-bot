@@ -14,6 +14,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from contextlib import asynccontextmanager
 import asyncio
+import time
+import tiktoken
 
 # ──────────────────────── 环境变量配置 ────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -23,10 +25,11 @@ MODEL_NAME     = os.environ.get("MODEL_NAME", "deepseek-chat")
 BOT_PERSONALITY = os.environ.get("BOT_PERSONALITY", "你是一个聪明又有趣的助手，请说中文。")
 
 # 🎛️ 可控参数
-MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "8000"))
+MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "4000"))
 LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
-STREAM_SWITCH      = os.environ.get("STREAM_SWITCH", "false").lower() == "true"  # ✅ 流式开关
+LLM_MAX_TOKENS     = int(os.environ.get("LLM_MAX_TOKENS", "500"))  # 从2000改为500
+MAX_HISTORY_ROUNDS = int(os.environ.get("MAX_HISTORY_ROUNDS", "10"))  # 新增：最大历史轮数
+CONTEXT_TIMEOUT    = int(os.environ.get("CONTEXT_TIMEOUT", "10"))  # 新增：上下文超时时间（分钟）
 
 PORT               = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH       = "/webhook"
@@ -34,14 +37,40 @@ RENDER_EXTERNAL_HOSTNAME = os.environ["RENDER_EXTERNAL_HOSTNAME"]
 WEBHOOK_URL        = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
 
 # ──────────────────────── 初始化 ────────────────────────
-user_history = defaultdict(list)
+# 修改 user_history 结构，包含消息历史和最后访问时间
+user_history = defaultdict(lambda: {"history": [], "last_access": time.time()})
 client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=60.0)
 tg_app = None
 
-# ──────────────────────── 简单的 token 估算函数 ────────────────────────
+# ──────────────────────── Token 估算函数 ────────────────────────
+# 使用 tiktoken 进行更准确的 token 计算
+encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")  # 可根据实际模型调整
+
 def estimate_tokens(messages):
-    text = "".join([msg["content"] for msg in messages])
-    return len(text) // 1.5
+    """使用 tiktoken 准确计算 token 数量"""
+    try:
+        text = "".join([msg["content"] for msg in messages])
+        return len(encoding.encode(text))
+    except Exception:
+        # 备用方案：字符数估算
+        text = "".join([msg["content"] for msg in messages])
+        return len(text) // 1.5
+
+# ──────────────────────── 清理过期上下文 ────────────────────────
+def cleanup_expired_context():
+    """清理过期的用户上下文"""
+    current_time = time.time()
+    expired_users = []
+    
+    for user_id, user_data in user_history.items():
+        # 检查时间超时
+        if current_time - user_data["last_access"] > CONTEXT_TIMEOUT * 60:
+            expired_users.append(user_id)
+    
+    # 清理过期用户
+    for user_id in expired_users:
+        del user_history[user_id]
+        print(f"[清理] 用户 {user_id} 的上下文已过期并被清理")
 
 # ──────────────────────── Handlers ────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49,7 +78,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_history[user_id].clear()
+    if user_id in user_history:
+        user_history[user_id]["history"].clear()
+        user_history[user_id]["last_access"] = time.time()
     await update.message.reply_text("✅ 已重置对话历史")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,25 +88,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text: return
 
-    history = user_history[user_id]
+    # 更新最后访问时间
+    if user_id not in user_history:
+        user_history[user_id] = {"history": [], "last_access": time.time()}
+    else:
+        user_history[user_id]["last_access"] = time.time()
+    
+    # 清理过期上下文
+    cleanup_expired_context()
+    
+    history = user_history[user_id]["history"]
     history.append({"role": "user", "content": text})
     
-    # 🔁 控制上下文长度
+    # 🔁 控制上下文长度和轮数
     while True:
         system_msg = {"role": "system", "content": BOT_PERSONALITY}
         full_context = [system_msg] + history
         tokens = estimate_tokens(full_context)
         
+        # 检查 token 数量
         if tokens <= MAX_CONTEXT_TOKENS:
             messages = full_context
             break
+        # 检查历史轮数
+        elif len(history) > MAX_HISTORY_ROUNDS * 2:  # user + assistant 为一轮
+            history = history[2:]  # 移除最前面的一轮对话
+        # 剪裁历史记录
         elif len(history) > 1:
             if len(history) >= 2 and history[0]["role"] == "user" and history[1]["role"] == "assistant":
                 history = history[2:]
             else:
                 history = history[1:]
         else:
-            history[-1]["content"] = history[-1]["content"][-1000:]
+            # 最后手段：裁剪单条消息内容
+            history[-1]["content"] = history[-1]["content"][-500:]  # 减少到500字符
             break
 
     # 🔄 根据 STREAM_SWITCH 决定调用方式
@@ -175,6 +221,8 @@ async def init():
     print(f"   - 最大上下文: {MAX_CONTEXT_TOKENS} tokens")
     print(f"   - 温度: {LLM_TEMPERATURE}")
     print(f"   - 最大输出: {LLM_MAX_TOKENS}")
+    print(f"   - 最大历史轮数: {MAX_HISTORY_ROUNDS}")
+    print(f"   - 上下文超时: {CONTEXT_TIMEOUT} 分钟")
     print(f"   - 流式传输: {'✅' if STREAM_SWITCH else '❌'}")
 
 # ──────────────────────── FastAPI APP Setup ────────────────────────
